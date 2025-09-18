@@ -1,0 +1,30 @@
+# Sample HTML reports
+sample-report.html
+sample-report-updated.html
+
+# Generated reports directory
+Reports/
+*.html
+*.csv
+
+# PowerShell module cache
+*.psm1
+
+# Temporary files
+*.tmp
+*.temp
+
+# Configuration files (may contain sensitive data)
+Config/settings.json
+
+# Log files
+*.log
+
+# VS Code settings
+.vscode/
+
+# Windows thumbnail cache
+Thumbs.db
+
+# macOS
+.DS_Store

@@ -89,6 +89,7 @@ param(
 $Script:StartTime = Get-Date
 $Script:ScriptVersion = "1.0.0"
 $Script:HealthResults = @()
+$Script:TrellixInfo = @()
 $Script:SummaryStats = @{
     Critical = 0
     Warning = 0
@@ -179,12 +180,14 @@ function Add-HealthResult {
         [ValidateSet("Critical", "Warning", "Info", "Pass")]
         [string]$Status,
         [string]$Message,
-        [object]$Details = $null
+        [object]$Details = $null,
+        [string]$OSVersion = ""
     )
 
     $result = [PSCustomObject]@{
         Timestamp = Get-Date
         ComputerName = $ComputerName
+        OSVersion = $OSVersion
         Component = $Component
         Check = $Check
         Status = $Status
@@ -331,6 +334,16 @@ function Test-SystemHealth {
                 continue
             }
 
+            # Get OS version for this computer
+            $osVersion = ""
+            try {
+                $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $Computer -ErrorAction Stop
+                $osVersion = $os.Caption.Trim()
+            }
+            catch {
+                $osVersion = "Unknown"
+            }
+
             # Check disk space
             try {
                 $disks = Get-WmiObject -Class Win32_LogicalDisk -ComputerName $Computer -Filter "DriveType=3" -ErrorAction Stop
@@ -338,18 +351,18 @@ function Test-SystemHealth {
                     $freePercent = [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 2)
 
                     if ($freePercent -lt $Config.DiskSpaceCriticalThreshold) {
-                        Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace_$($disk.DeviceID)" -Status "Critical" -Message "Disk $($disk.DeviceID) has only $freePercent% free space"
+                        Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace_$($disk.DeviceID)" -Status "Critical" -Message "Disk $($disk.DeviceID) has only $freePercent% free space" -OSVersion $osVersion
                     }
                     elseif ($freePercent -lt $Config.DiskSpaceWarningThreshold) {
-                        Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace_$($disk.DeviceID)" -Status "Warning" -Message "Disk $($disk.DeviceID) has $freePercent% free space"
+                        Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace_$($disk.DeviceID)" -Status "Warning" -Message "Disk $($disk.DeviceID) has $freePercent% free space" -OSVersion $osVersion
                     }
                     else {
-                        Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace_$($disk.DeviceID)" -Status "Pass" -Message "Disk $($disk.DeviceID) has $freePercent% free space"
+                        Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace_$($disk.DeviceID)" -Status "Pass" -Message "Disk $($disk.DeviceID) has $freePercent% free space" -OSVersion $osVersion
                     }
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace" -Status "Warning" -Message "Could not check disk space: $($_.Exception.Message)"
+                Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace" -Status "Warning" -Message "Could not check disk space: $($_.Exception.Message)" -OSVersion $osVersion
             }
 
             # Check uptime
@@ -358,17 +371,17 @@ function Test-SystemHealth {
                 $uptime = (Get-Date) - $os.ConvertToDateTime($os.LastBootUpTime)
 
                 if ($uptime.Days -gt $Config.UptimeCriticalDays) {
-                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Critical" -Message "System has not rebooted in $($uptime.Days) days"
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Critical" -Message "System has not rebooted in $($uptime.Days) days" -OSVersion $osVersion
                 }
                 elseif ($uptime.Days -gt $Config.UptimeWarningDays) {
-                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Warning" -Message "System has not rebooted in $($uptime.Days) days"
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Warning" -Message "System has not rebooted in $($uptime.Days) days" -OSVersion $osVersion
                 }
                 else {
-                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Pass" -Message "System uptime: $($uptime.Days) days"
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Pass" -Message "System uptime: $($uptime.Days) days" -OSVersion $osVersion
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Warning" -Message "Could not check uptime: $($_.Exception.Message)"
+                Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Warning" -Message "Could not check uptime: $($_.Exception.Message)" -OSVersion $osVersion
             }
 
             # Check memory usage
@@ -377,22 +390,22 @@ function Test-SystemHealth {
                 $memoryUsage = [math]::Round((($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / $memory.TotalVisibleMemorySize) * 100, 2)
 
                 if ($memoryUsage -gt 90) {
-                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Critical" -Message "Memory usage is $memoryUsage%"
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Critical" -Message "Memory usage is $memoryUsage%" -OSVersion $osVersion
                 }
                 elseif ($memoryUsage -gt 80) {
-                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Warning" -Message "Memory usage is $memoryUsage%"
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Warning" -Message "Memory usage is $memoryUsage%" -OSVersion $osVersion
                 }
                 else {
-                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Pass" -Message "Memory usage is $memoryUsage%"
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Pass" -Message "Memory usage is $memoryUsage%" -OSVersion $osVersion
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Warning" -Message "Could not check memory usage: $($_.Exception.Message)"
+                Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Warning" -Message "Could not check memory usage: $($_.Exception.Message)" -OSVersion $osVersion
             }
 
         }
         catch {
-            Add-HealthResult -ComputerName $Computer -Component "System" -Check "General" -Status "Critical" -Message "Failed to check system health: $($_.Exception.Message)"
+            Add-HealthResult -ComputerName $Computer -Component "System" -Check "General" -Status "Critical" -Message "Failed to check system health: $($_.Exception.Message)" -OSVersion "Unknown"
         }
     }
 }
@@ -463,41 +476,100 @@ function Test-SecurityServices {
                 try {
                     $svc = Get-Service -Name $service -ComputerName $Computer -ErrorAction Stop
                     if ($svc.Status -ne "Running") {
-                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Critical" -Message "Trellix service $service is $($svc.Status)"
+                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Critical" -Message "Trellix service $service is $($svc.Status)" -OSVersion "Unknown"
                     } else {
-                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Pass" -Message "Trellix service $service is running"
+                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Pass" -Message "Trellix service $service is running" -OSVersion "Unknown"
                     }
                 }
                 catch {
-                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Warning" -Message "Trellix service $service not found or inaccessible"
+                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Warning" -Message "Trellix service $service not found or inaccessible" -OSVersion "Unknown"
                 }
             }
 
-            # Check Trellix DAT version
+            # Check Trellix DAT version and collect version info
             try {
-                $trellixReg = Invoke-Command -ComputerName $Computer -ScriptBlock {
-                    Get-ItemProperty -Path "HKLM:\SOFTWARE\McAfee\AVEngine" -Name "AVDatVersion" -ErrorAction SilentlyContinue
+                $trellixInfo = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    # Get DAT version
+                    $datReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\McAfee\AVEngine" -Name "AVDatVersion" -ErrorAction SilentlyContinue
+
+                    # Get product version
+                    $productReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\McAfee\EPSCore" -Name "szProductVer" -ErrorAction SilentlyContinue
+                    if (-not $productReg) {
+                        $productReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\McAfee\DesktopProtection" -Name "szProductVer" -ErrorAction SilentlyContinue
+                    }
+
+                    # Get engine version
+                    $engineReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\McAfee\AVEngine" -Name "EngineVersionMajor", "EngineVersionMinor" -ErrorAction SilentlyContinue
+
+                    return @{
+                        DATVersion = $datReg.AVDatVersion
+                        ProductVersion = $productReg.szProductVer
+                        EngineVersionMajor = $engineReg.EngineVersionMajor
+                        EngineVersionMinor = $engineReg.EngineVersionMinor
+                    }
                 } -ErrorAction Stop
 
-                if ($trellixReg.AVDatVersion) {
-                    $datDate = [DateTime]::ParseExact($trellixReg.AVDatVersion.Substring(0,8), "yyyyMMdd", $null)
+                # Get OS version for this computer
+                $osVersion = ""
+                try {
+                    $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $Computer -ErrorAction Stop
+                    $osVersion = $os.Caption.Trim()
+                }
+                catch {
+                    $osVersion = "Unknown"
+                }
+
+                # Store Trellix info for separate table
+                $Script:TrellixInfo += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    OSVersion = $osVersion
+                    ProductVersion = $trellixInfo.ProductVersion -replace $null, "Unknown"
+                    EngineVersion = if ($trellixInfo.EngineVersionMajor -and $trellixInfo.EngineVersionMinor) {
+                        "$($trellixInfo.EngineVersionMajor).$($trellixInfo.EngineVersionMinor)"
+                    } else {
+                        "Unknown"
+                    }
+                    DATVersion = $trellixInfo.DATVersion -replace $null, "Unknown"
+                    DATDate = if ($trellixInfo.DATVersion) {
+                        try {
+                            [DateTime]::ParseExact($trellixInfo.DATVersion.Substring(0,8), "yyyyMMdd", $null).ToString('yyyy-MM-dd')
+                        } catch {
+                            "Unknown"
+                        }
+                    } else {
+                        "Unknown"
+                    }
+                }
+
+                if ($trellixInfo.DATVersion) {
+                    $datDate = [DateTime]::ParseExact($trellixInfo.DATVersion.Substring(0,8), "yyyyMMdd", $null)
                     $daysSinceUpdate = (Get-Date) - $datDate
 
                     if ($daysSinceUpdate.Days -gt 7) {
-                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Critical" -Message "Trellix DAT files are $($daysSinceUpdate.Days) days old"
+                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Critical" -Message "Trellix DAT files are $($daysSinceUpdate.Days) days old" -OSVersion $osVersion
                     }
                     elseif ($daysSinceUpdate.Days -gt 3) {
-                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Warning" -Message "Trellix DAT files are $($daysSinceUpdate.Days) days old"
+                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Warning" -Message "Trellix DAT files are $($daysSinceUpdate.Days) days old" -OSVersion $osVersion
                     }
                     else {
-                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Pass" -Message "Trellix DAT files are current ($($datDate.ToString('yyyy-MM-dd')))"
+                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Pass" -Message "Trellix DAT files are current ($($datDate.ToString('yyyy-MM-dd')))" -OSVersion $osVersion
                     }
                 } else {
-                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Warning" -Message "Could not determine Trellix DAT version"
+                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Warning" -Message "Could not determine Trellix DAT version" -OSVersion $osVersion
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Warning" -Message "Could not check Trellix DAT version: $($_.Exception.Message)"
+                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_DAT" -Status "Warning" -Message "Could not check Trellix DAT version: $($_.Exception.Message)" -OSVersion "Unknown"
+
+                # Add minimal Trellix info entry for failed checks
+                $Script:TrellixInfo += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    OSVersion = "Unknown"
+                    ProductVersion = "Check Failed"
+                    EngineVersion = "Check Failed"
+                    DATVersion = "Check Failed"
+                    DATDate = "Check Failed"
+                }
             }
 
             # Check Splunk services
@@ -564,6 +636,184 @@ function Test-SecurityServices {
         }
         catch {
             Add-HealthResult -ComputerName $Computer -Component "Security" -Check "General" -Status "Critical" -Message "Failed to check security services: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Test Client OS Health (Windows 10/11 specific checks)
+function Test-ClientOSHealth {
+    param(
+        [string[]]$ComputerNames,
+        [hashtable]$Config
+    )
+
+    Write-Host "Checking Client OS Health..." -ForegroundColor Cyan
+
+    foreach ($Computer in $ComputerNames) {
+        try {
+            # Test connectivity first
+            if (-not (Test-NetConnection -ComputerName $Computer -InformationLevel Quiet)) {
+                continue
+            }
+
+            # Get OS version for this computer
+            $osVersion = ""
+            try {
+                $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $Computer -ErrorAction Stop
+                $osVersion = $os.Caption.Trim()
+            }
+            catch {
+                $osVersion = "Unknown"
+            }
+
+            # Check BitLocker encryption status
+            try {
+                $bitlockerStatus = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    $drives = Get-WmiObject -Class Win32_EncryptableVolume -Namespace "Root\CIMv2\Security\MicrosoftVolumeEncryption" -ErrorAction SilentlyContinue
+                    $results = @()
+                    foreach ($drive in $drives) {
+                        $results += [PSCustomObject]@{
+                            Drive = $drive.DriveLetter
+                            EncryptionMethod = $drive.EncryptionMethod
+                            ProtectionStatus = $drive.ProtectionStatus
+                            ConversionStatus = $drive.ConversionStatus
+                        }
+                    }
+                    return $results
+                } -ErrorAction Stop
+
+                if ($bitlockerStatus) {
+                    foreach ($drive in $bitlockerStatus) {
+                        if ($drive.Drive -eq "C:") {
+                            if ($drive.ProtectionStatus -eq 1) {
+                                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "BitLocker_$($drive.Drive)" -Status "Pass" -Message "BitLocker enabled and protecting drive $($drive.Drive)" -OSVersion $osVersion
+                            }
+                            elseif ($drive.ProtectionStatus -eq 0 -and $drive.ConversionStatus -eq 2) {
+                                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "BitLocker_$($drive.Drive)" -Status "Warning" -Message "BitLocker encryption in progress on drive $($drive.Drive)" -OSVersion $osVersion
+                            }
+                            else {
+                                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "BitLocker_$($drive.Drive)" -Status "Critical" -Message "BitLocker not enabled on system drive $($drive.Drive)" -OSVersion $osVersion
+                            }
+                        }
+                        else {
+                            if ($drive.ProtectionStatus -eq 1) {
+                                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "BitLocker_$($drive.Drive)" -Status "Pass" -Message "BitLocker enabled on drive $($drive.Drive)" -OSVersion $osVersion
+                            }
+                            else {
+                                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "BitLocker_$($drive.Drive)" -Status "Info" -Message "BitLocker not enabled on drive $($drive.Drive)" -OSVersion $osVersion
+                            }
+                        }
+                    }
+                } else {
+                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "BitLocker" -Status "Critical" -Message "BitLocker not available or accessible" -OSVersion $osVersion
+                }
+            }
+            catch {
+                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "BitLocker" -Status "Warning" -Message "Could not check BitLocker status: $($_.Exception.Message)" -OSVersion $osVersion
+            }
+
+            # Check User Profile health
+            try {
+                $profileHealth = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    $tempProfiles = Get-ChildItem "C:\Users" | Where-Object { $_.Name -like "TEMP*" }
+                    $corruptProfiles = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" -ErrorAction SilentlyContinue |
+                                      Where-Object { $_.State -eq 0x2 -or $_.State -eq 0x4 }
+
+                    return @{
+                        TempProfileCount = $tempProfiles.Count
+                        CorruptProfileCount = $corruptProfiles.Count
+                    }
+                } -ErrorAction Stop
+
+                if ($profileHealth.CorruptProfileCount -gt 0) {
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "UserProfiles" -Status "Critical" -Message "$($profileHealth.CorruptProfileCount) corrupt user profiles detected" -OSVersion $osVersion
+                }
+                elseif ($profileHealth.TempProfileCount -gt 0) {
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "UserProfiles" -Status "Warning" -Message "$($profileHealth.TempProfileCount) temporary profiles detected" -OSVersion $osVersion
+                }
+                else {
+                    Add-HealthResult -ComputerName $Computer -Component "System" -Check "UserProfiles" -Status "Pass" -Message "User profiles healthy" -OSVersion $osVersion
+                }
+            }
+            catch {
+                Add-HealthResult -ComputerName $Computer -Component "System" -Check "UserProfiles" -Status "Warning" -Message "Could not check user profile health: $($_.Exception.Message)" -OSVersion $osVersion
+            }
+
+            # Check Hardware and Driver health
+            try {
+                $deviceIssues = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    $errorDevices = Get-WmiObject -Class Win32_PnPEntity | Where-Object {
+                        $_.ConfigManagerErrorCode -ne 0 -and $_.ConfigManagerErrorCode -ne $null
+                    }
+                    return $errorDevices.Count
+                } -ErrorAction Stop
+
+                if ($deviceIssues -gt 0) {
+                    Add-HealthResult -ComputerName $Computer -Component "Hardware" -Check "DeviceManager" -Status "Warning" -Message "$deviceIssues devices with errors in Device Manager" -OSVersion $osVersion
+                }
+                else {
+                    Add-HealthResult -ComputerName $Computer -Component "Hardware" -Check "DeviceManager" -Status "Pass" -Message "No device errors detected" -OSVersion $osVersion
+                }
+            }
+            catch {
+                Add-HealthResult -ComputerName $Computer -Component "Hardware" -Check "DeviceManager" -Status "Warning" -Message "Could not check device status: $($_.Exception.Message)" -OSVersion $osVersion
+            }
+
+            # Check TPM status (Windows 11 requirement)
+            try {
+                $tpmStatus = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    $tpm = Get-WmiObject -Class Win32_Tpm -Namespace "Root\CIMv2\Security\MicrosoftTpm" -ErrorAction SilentlyContinue
+                    if ($tpm) {
+                        return @{
+                            Present = $true
+                            Enabled = $tpm.IsEnabled_InitialValue
+                            Activated = $tpm.IsActivated_InitialValue
+                            Version = $tpm.SpecVersion
+                        }
+                    }
+                    return @{ Present = $false }
+                } -ErrorAction Stop
+
+                if ($tpmStatus.Present) {
+                    if ($tpmStatus.Enabled -and $tpmStatus.Activated) {
+                        Add-HealthResult -ComputerName $Computer -Component "Hardware" -Check "TPM" -Status "Pass" -Message "TPM $($tpmStatus.Version) enabled and activated" -OSVersion $osVersion
+                    }
+                    else {
+                        Add-HealthResult -ComputerName $Computer -Component "Hardware" -Check "TPM" -Status "Warning" -Message "TPM present but not properly configured" -OSVersion $osVersion
+                    }
+                }
+                else {
+                    Add-HealthResult -ComputerName $Computer -Component "Hardware" -Check "TPM" -Status "Critical" -Message "TPM not present (required for Windows 11)" -OSVersion $osVersion
+                }
+            }
+            catch {
+                Add-HealthResult -ComputerName $Computer -Component "Hardware" -Check "TPM" -Status "Info" -Message "Could not check TPM status" -OSVersion $osVersion
+            }
+
+            # Check Network adapter status
+            try {
+                $networkIssues = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    $adapters = Get-WmiObject -Class Win32_NetworkAdapter | Where-Object {
+                        $_.NetConnectionStatus -ne $null -and $_.AdapterType -like "*Ethernet*" -or $_.AdapterType -like "*802.11*"
+                    }
+                    $downAdapters = $adapters | Where-Object { $_.NetConnectionStatus -ne 2 }
+                    return $downAdapters.Count
+                } -ErrorAction Stop
+
+                if ($networkIssues -gt 0) {
+                    Add-HealthResult -ComputerName $Computer -Component "Network" -Check "NetworkAdapters" -Status "Warning" -Message "$networkIssues network adapters not connected" -OSVersion $osVersion
+                }
+                else {
+                    Add-HealthResult -ComputerName $Computer -Component "Network" -Check "NetworkAdapters" -Status "Pass" -Message "Network adapters connected" -OSVersion $osVersion
+                }
+            }
+            catch {
+                Add-HealthResult -ComputerName $Computer -Component "Network" -Check "NetworkAdapters" -Status "Warning" -Message "Could not check network adapter status: $($_.Exception.Message)" -OSVersion $osVersion
+            }
+
+        }
+        catch {
+            Add-HealthResult -ComputerName $Computer -Component "ClientOS" -Check "General" -Status "Critical" -Message "Failed to check client OS health: $($_.Exception.Message)" -OSVersion "Unknown"
         }
     }
 }
@@ -930,7 +1180,22 @@ function New-HealthReport {
         .results-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         .results-table th, .results-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
         .results-table th { background-color: #34495e; color: white; }
-        .results-table tr:nth-child(even) { background-color: #f2f2f2; }
+        .system-group-header {
+            background: linear-gradient(135deg, #34495e, #2c3e50) !important;
+            color: white !important;
+            font-weight: bold;
+            font-size: 1.1em;
+            padding: 12px !important;
+            border-left: 5px solid #3498db !important;
+            text-align: center;
+        }
+        .system-group-odd { background-color: #f8f9fa; }
+        .system-group-even { background-color: #ffffff; }
+        .system-group-border { border-top: 2px solid #bdc3c7; }
+        .results-table tbody tr:hover {
+            background-color: #e8f4fd !important;
+            transition: background-color 0.2s;
+        }
         .status-critical { color: #e74c3c; font-weight: bold; }
         .status-warning { color: #f39c12; font-weight: bold; }
         .status-info { color: #3498db; font-weight: bold; }
@@ -973,6 +1238,7 @@ function New-HealthReport {
             <tr>
                 <th>Timestamp</th>
                 <th>Computer</th>
+                <th>OS Version</th>
                 <th>Component</th>
                 <th>Check</th>
                 <th>Status</th>
@@ -982,16 +1248,74 @@ function New-HealthReport {
         <tbody>
 "@
 
-    foreach ($result in ($Results | Sort-Object ComputerName, Component, Check)) {
-        $statusClass = "status-" + $result.Status.ToLower()
+    # Group results by computer for system grouping
+    $groupedResults = $Results | Sort-Object ComputerName, Component, Check | Group-Object ComputerName
+    $systemIndex = 0
+
+    foreach ($computerGroup in $groupedResults) {
+        $computerName = $computerGroup.Name
+        $computerResults = $computerGroup.Group
+        $isOddGroup = ($systemIndex % 2) -eq 1
+        $groupClass = if ($isOddGroup) { "system-group-odd" } else { "system-group-even" }
+        $borderClass = if ($systemIndex -gt 0) { "system-group-border" } else { "" }
+
+        # Get OS version from first result for this computer
+        $osVersion = if ($computerResults.Count -gt 0) { $computerResults[0].OSVersion } else { "Unknown" }
+
+        # Add system header row
         $html += @"
-            <tr>
+            <tr class="system-group-header $borderClass">
+                <td colspan="7">$computerName ($osVersion)</td>
+            </tr>
+"@
+
+        # Add individual result rows for this computer
+        foreach ($result in $computerResults) {
+            $statusClass = "status-" + $result.Status.ToLower()
+            $html += @"
+            <tr class="$groupClass">
                 <td>$($result.Timestamp.ToString('yyyy-MM-dd HH:mm:ss'))</td>
                 <td>$($result.ComputerName)</td>
+                <td>$($result.OSVersion)</td>
                 <td>$($result.Component)</td>
                 <td>$($result.Check)</td>
                 <td class="$statusClass">$($result.Status)</td>
                 <td>$($result.Message)</td>
+            </tr>
+"@
+        }
+
+        $systemIndex++
+    }
+
+    $html += @"
+        </tbody>
+    </table>
+
+    <h2>Trellix Endpoint Security Status</h2>
+    <table class="results-table">
+        <thead>
+            <tr>
+                <th>Computer Name</th>
+                <th>OS Version</th>
+                <th>Product Version</th>
+                <th>Engine Version</th>
+                <th>DAT Version</th>
+                <th>DAT Date</th>
+            </tr>
+        </thead>
+        <tbody>
+"@
+
+    foreach ($trellix in ($Script:TrellixInfo | Sort-Object ComputerName)) {
+        $html += @"
+            <tr>
+                <td>$($trellix.ComputerName)</td>
+                <td>$($trellix.OSVersion)</td>
+                <td>$($trellix.ProductVersion)</td>
+                <td>$($trellix.EngineVersion)</td>
+                <td>$($trellix.DATVersion)</td>
+                <td>$($trellix.DATDate)</td>
             </tr>
 "@
     }
@@ -1068,15 +1392,53 @@ function Main {
         }
     }
 
-    # Run health checks
+    # Categorize computers by OS type
+    $serverComputers = @()
+    $clientComputers = @()
+
+    foreach ($computer in $targetComputers) {
+        try {
+            $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $computer -ErrorAction Stop
+            if ($os.Caption -like "*Server*") {
+                $serverComputers += $computer
+            }
+            elseif ($os.Caption -like "*Windows 10*" -or $os.Caption -like "*Windows 11*") {
+                $clientComputers += $computer
+            }
+            else {
+                # Default to server category for unknown Windows versions
+                $serverComputers += $computer
+            }
+        }
+        catch {
+            # If we can't determine OS, default to server category
+            $serverComputers += $computer
+        }
+    }
+
+    Write-Host "Found $($serverComputers.Count) server systems and $($clientComputers.Count) client systems" -ForegroundColor Cyan
+
+    # Run infrastructure health checks (always run these)
     Test-ADHealth -DomainControllers $domainControllers
     Test-DNSHealth -DNSServers $domainControllers
+
+    # Run health checks for all systems
     Test-SystemHealth -ComputerNames $targetComputers -Config $config
     Test-StorageHealth -ComputerNames $targetComputers
     Test-SecurityServices -ComputerNames $targetComputers -Config $config
     Test-LicensingHealth -ComputerNames $targetComputers
-    Test-CriticalServices -ComputerNames $targetComputers
 
+    # Run server-specific checks
+    if ($serverComputers.Count -gt 0) {
+        Test-CriticalServices -ComputerNames $serverComputers
+    }
+
+    # Run client-specific checks
+    if ($clientComputers.Count -gt 0) {
+        Test-ClientOSHealth -ComputerNames $clientComputers -Config $config
+    }
+
+    # Run Hyper-V checks
     if ($hypervHosts.Count -gt 0) {
         Test-HyperVHealth -HyperVHosts $hypervHosts
     }
