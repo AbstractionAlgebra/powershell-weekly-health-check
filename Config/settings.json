@@ -1,0 +1,25 @@
+{
+    "DiskSpaceWarningThreshold": 20,
+    "DiskSpaceCriticalThreshold": 10,
+    "UptimeWarningDays": 35,
+    "UptimeCriticalDays": 45,
+    "CertificateWarningDays": 90,
+    "CertificateCriticalDays": 30,
+    "TrellixServices": [
+        "McAfeeFramework",
+        "mfemms",
+        "mfevtp",
+        "McShield",
+        "mfefire"
+    ],
+    "SplunkServices": [
+        "SplunkForwarder"
+    ],
+    "MemoryWarningThreshold": 80,
+    "MemoryCriticalThreshold": 90,
+    "DiskQueueLengthThreshold": 10,
+    "TrellixDATWarningDays": 3,
+    "TrellixDATCriticalDays": 7,
+    "WindowsUpdateWarningDays": 30,
+    "WindowsUpdateCriticalDays": 60
+}
