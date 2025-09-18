@@ -90,6 +90,7 @@ $Script:StartTime = Get-Date
 $Script:ScriptVersion = "1.0.0"
 $Script:HealthResults = @()
 $Script:TrellixInfo = @()
+$Script:WindowsSecuritySummary = @()
 $Script:SummaryStats = @{
     Critical = 0
     Warning = 0
@@ -818,6 +819,150 @@ function Test-ClientOSHealth {
     }
 }
 
+# Collect Windows Security Summary
+function Get-WindowsSecuritySummary {
+    param([string[]]$ComputerNames)
+
+    Write-Host "Collecting Windows Security Summary..." -ForegroundColor Cyan
+
+    foreach ($Computer in $ComputerNames) {
+        try {
+            # Test connectivity first
+            if (-not (Test-NetConnection -ComputerName $Computer -InformationLevel Quiet)) {
+                # Add entry for failed connection
+                $Script:WindowsSecuritySummary += [PSCustomObject]@{
+                    ComputerName = $Computer
+                    OSName = "Connection Failed"
+                    OSVersion = "N/A"
+                    BitLockerStatus = "N/A"
+                    SecureBootEnabled = "N/A"
+                    UptimeDays = "N/A"
+                }
+                continue
+            }
+
+            # Collect comprehensive security information
+            $securityInfo = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                $results = @{}
+
+                # Get OS information
+                try {
+                    $os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop
+                    $results.OSName = $os.Caption.Trim()
+
+                    # Extract OS version (build number and feature update)
+                    $osVersionInfo = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction SilentlyContinue
+                    if ($osVersionInfo) {
+                        $buildNumber = $osVersionInfo.CurrentBuild
+                        $ubr = $osVersionInfo.UBR
+                        $displayVersion = $osVersionInfo.DisplayVersion
+                        $releaseId = $osVersionInfo.ReleaseId
+
+                        # Determine version name based on build number
+                        $versionName = switch ($buildNumber) {
+                            "17763" { "1809" }
+                            "18362" { "1903" }
+                            "18363" { "1909" }
+                            "19041" { "2004" }
+                            "19042" { "20H2" }
+                            "19043" { "21H1" }
+                            "19044" { "21H2" }
+                            "22000" { "21H2" }
+                            "22621" { "22H2" }
+                            "22631" { "23H2" }
+                            "26100" { "24H2" }
+                            default {
+                                if ($displayVersion) { $displayVersion }
+                                elseif ($releaseId) { $releaseId }
+                                else { $buildNumber }
+                            }
+                        }
+
+                        # Check for LTSC
+                        if ($results.OSName -like "*LTSC*" -or $results.OSName -like "*Long-Term Servicing*") {
+                            $versionName += " LTSC"
+                        }
+
+                        $results.OSVersion = $versionName
+                    } else {
+                        $results.OSVersion = "Unknown"
+                    }
+
+                    # Calculate uptime
+                    $uptime = (Get-Date) - $os.ConvertToDateTime($os.LastBootUpTime)
+                    $results.UptimeDays = $uptime.Days
+                } catch {
+                    $results.OSName = "Unknown"
+                    $results.OSVersion = "Unknown"
+                    $results.UptimeDays = "Unknown"
+                }
+
+                # Check BitLocker status for all drives
+                try {
+                    $bitlockerDrives = Get-WmiObject -Class Win32_EncryptableVolume -Namespace "Root\CIMv2\Security\MicrosoftVolumeEncryption" -ErrorAction SilentlyContinue
+                    if ($bitlockerDrives) {
+                        $encryptedDrives = $bitlockerDrives | Where-Object { $_.ProtectionStatus -eq 1 }
+                        $totalDrives = $bitlockerDrives | Where-Object { $_.DriveLetter -match "^[A-Z]:$" }
+
+                        if ($encryptedDrives.Count -eq $totalDrives.Count -and $totalDrives.Count -gt 0) {
+                            $results.BitLockerStatus = "Fully Encrypted"
+                        } elseif ($encryptedDrives.Count -gt 0) {
+                            $results.BitLockerStatus = "Partially Encrypted ($($encryptedDrives.Count)/$($totalDrives.Count))"
+                        } else {
+                            $results.BitLockerStatus = "Not Encrypted"
+                        }
+                    } else {
+                        $results.BitLockerStatus = "Not Supported"
+                    }
+                } catch {
+                    $results.BitLockerStatus = "Check Failed"
+                }
+
+                # Check Secure Boot status
+                try {
+                    $secureBootPolicy = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name "UEFISecureBootEnabled" -ErrorAction SilentlyContinue
+                    if ($secureBootPolicy -and $secureBootPolicy.UEFISecureBootEnabled -eq 1) {
+                        $results.SecureBootEnabled = "Enabled"
+                    } else {
+                        # Alternative check for Secure Boot
+                        $confirmSecureBoot = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+                        if ($confirmSecureBoot) {
+                            $results.SecureBootEnabled = "Enabled"
+                        } else {
+                            $results.SecureBootEnabled = "Disabled"
+                        }
+                    }
+                } catch {
+                    $results.SecureBootEnabled = "Check Failed"
+                }
+
+                return $results
+            } -ErrorAction Stop
+
+            # Create security summary entry
+            $Script:WindowsSecuritySummary += [PSCustomObject]@{
+                ComputerName = $Computer
+                OSName = $securityInfo.OSName
+                OSVersion = $securityInfo.OSVersion
+                BitLockerStatus = $securityInfo.BitLockerStatus
+                SecureBootEnabled = $securityInfo.SecureBootEnabled
+                UptimeDays = $securityInfo.UptimeDays
+            }
+
+        } catch {
+            # Add entry for failed data collection
+            $Script:WindowsSecuritySummary += [PSCustomObject]@{
+                ComputerName = $Computer
+                OSName = "Data Collection Failed"
+                OSVersion = "N/A"
+                BitLockerStatus = "N/A"
+                SecureBootEnabled = "N/A"
+                UptimeDays = "N/A"
+            }
+        }
+    }
+}
+
 # Test Hyper-V Health
 function Test-HyperVHealth {
     param([string[]]$HyperVHosts)
@@ -1292,6 +1437,60 @@ function New-HealthReport {
         </tbody>
     </table>
 
+    <h2>Windows Security Summary</h2>
+    <table class="results-table">
+        <thead>
+            <tr>
+                <th>Computer Name</th>
+                <th>OS Name</th>
+                <th>OS Version</th>
+                <th>BitLocker Status</th>
+                <th>SecureBoot Enabled</th>
+                <th>Uptime (Days)</th>
+            </tr>
+        </thead>
+        <tbody>
+"@
+
+    foreach ($security in ($Script:WindowsSecuritySummary | Sort-Object ComputerName)) {
+        # Apply color coding based on security status
+        $bitlockerClass = switch ($security.BitLockerStatus) {
+            "Fully Encrypted" { "status-pass" }
+            { $_ -like "Partially Encrypted*" } { "status-warning" }
+            "Not Encrypted" { "status-critical" }
+            "Not Supported" { "status-info" }
+            default { "" }
+        }
+
+        $secureBootClass = switch ($security.SecureBootEnabled) {
+            "Enabled" { "status-pass" }
+            "Disabled" { "status-warning" }
+            default { "" }
+        }
+
+        $uptimeClass = ""
+        if ($security.UptimeDays -ne "N/A" -and $security.UptimeDays -ne "Unknown") {
+            $uptimeClass = if ([int]$security.UptimeDays -gt 45) { "status-critical" }
+                          elseif ([int]$security.UptimeDays -gt 35) { "status-warning" }
+                          else { "status-pass" }
+        }
+
+        $html += @"
+            <tr>
+                <td>$($security.ComputerName)</td>
+                <td>$($security.OSName)</td>
+                <td>$($security.OSVersion)</td>
+                <td class="$bitlockerClass">$($security.BitLockerStatus)</td>
+                <td class="$secureBootClass">$($security.SecureBootEnabled)</td>
+                <td class="$uptimeClass">$($security.UptimeDays)</td>
+            </tr>
+"@
+    }
+
+    $html += @"
+        </tbody>
+    </table>
+
     <h2>Trellix Endpoint Security Status</h2>
     <table class="results-table">
         <thead>
@@ -1427,6 +1626,9 @@ function Main {
     Test-StorageHealth -ComputerNames $targetComputers
     Test-SecurityServices -ComputerNames $targetComputers -Config $config
     Test-LicensingHealth -ComputerNames $targetComputers
+
+    # Collect Windows Security Summary for all systems
+    Get-WindowsSecuritySummary -ComputerNames $targetComputers
 
     # Run server-specific checks
     if ($serverComputers.Count -gt 0) {
