@@ -36,9 +36,9 @@
 
 .NOTES
     File Name      : Invoke-WeeklyHealthCheck.ps1
-    Author         : System Administrator
+    Author         : Michael Angel
     Prerequisite   : PowerShell 5.1+, Windows Server 2019, Domain Controller
-    Created        : $(Get-Date -Format 'yyyy-MM-dd')
+    Created        : 2025-09-17
 
     REQUIREMENTS:
     - Run on Windows Server 2019 Domain Controller
