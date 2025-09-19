@@ -19,9 +19,6 @@
 .PARAMETER SkipHyperV
     Switch to skip Hyper-V related checks if not applicable to the environment.
 
-.PARAMETER Verbose
-    Enables verbose output for detailed logging and troubleshooting.
-
 .EXAMPLE
     .\Invoke-WeeklyHealthCheck.ps1
     Runs health check on all Windows computers in the domain using default settings.
@@ -79,10 +76,7 @@ param(
     [string[]]$ComputerName,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipHyperV,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$Verbose
+    [switch]$SkipHyperV
 )
 
 # Script variables
@@ -101,8 +95,42 @@ $Script:SummaryStats = @{
 # Import required modules
 try {
     Import-Module ActiveDirectory -ErrorAction Stop
-    if (-not $SkipHyperV -and (Get-WindowsFeature -Name Hyper-V).InstallState -eq "Installed") {
-        Import-Module Hyper-V -ErrorAction Stop
+
+    # Check for Hyper-V with fallback methods for different Windows versions
+    if (-not $SkipHyperV) {
+        $hypervInstalled = $false
+
+        # Try Get-WindowsFeature first (Server versions with ServerManager module)
+        try {
+            $hypervFeature = Get-WindowsFeature -Name Hyper-V -ErrorAction Stop
+            $hypervInstalled = $hypervFeature.InstallState -eq "Installed"
+        }
+        catch {
+            # Fallback to registry check for systems without ServerManager module
+            try {
+                $hypervReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages" -ErrorAction SilentlyContinue
+                $hypervInstalled = $hypervReg -and ($hypervReg | Where-Object { $_.PSChildName -like "*Hyper-V*" })
+            }
+            catch {
+                # Final fallback - try to load Hyper-V module directly
+                try {
+                    Import-Module Hyper-V -ErrorAction Stop
+                    $hypervInstalled = $true
+                }
+                catch {
+                    $hypervInstalled = $false
+                }
+            }
+        }
+
+        if ($hypervInstalled) {
+            try {
+                Import-Module Hyper-V -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Hyper-V appears to be installed but module failed to load: $($_.Exception.Message)"
+            }
+        }
     }
 }
 catch {
@@ -125,6 +153,10 @@ function Get-Configuration {
             CertificateCriticalDays = 30
             TrellixServices = @("McAfeeFramework", "mfemms", "mfevtp")
             SplunkServices = @("SplunkForwarder")
+            ConnectivityTimeoutSeconds = 10
+            ConnectivityRetryCount = 2
+            WinRMTimeoutSeconds = 15
+            WMITimeoutSeconds = 30
         }
     }
 
@@ -167,9 +199,213 @@ function Write-HealthLog {
         )
     }
 
-    if ($Verbose) {
+    if ($VerbosePreference -ne 'SilentlyContinue') {
         Write-Host "[$Level] $Message"
     }
+}
+
+# Test basic connectivity with retries and timeout
+function Test-ComputerConnectivity {
+    param(
+        [string]$ComputerName,
+        [int]$TimeoutSeconds = 10,
+        [int]$RetryCount = 2
+    )
+
+    for ($i = 0; $i -le $RetryCount; $i++) {
+        try {
+            # Try ping first for basic connectivity
+            $pingResult = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction Stop
+            if ($pingResult) {
+                return $true
+            }
+        }
+        catch {
+            # Continue to retry
+        }
+
+        if ($i -lt $RetryCount) {
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
+
+# Test WinRM connectivity with retries and timeout
+function Test-WinRMConnectivity {
+    param(
+        [string]$ComputerName,
+        [int]$TimeoutSeconds = 15,
+        [int]$RetryCount = 2
+    )
+
+    # First check basic connectivity
+    if (-not (Test-ComputerConnectivity -ComputerName $ComputerName -TimeoutSeconds 5 -RetryCount 1)) {
+        return $false
+    }
+
+    for ($attempt = 0; $attempt -le $RetryCount; $attempt++) {
+        try {
+            # Test WinRM port connectivity first
+            $portTestResult = $false
+
+            # Try Test-NetConnection first (available in PowerShell 4.0+)
+            try {
+                $portTestResult = Test-NetConnection -ComputerName $ComputerName -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
+            }
+            catch {
+                # Fallback to alternative method for older PowerShell versions
+                try {
+                    $tcpClient = New-Object System.Net.Sockets.TcpClient
+                    $result = $tcpClient.BeginConnect($ComputerName, 5985, $null, $null)
+                    $wait = $result.AsyncWaitHandle.WaitOne(3000, $false)
+                    $tcpClient.Close()
+                    $portTestResult = $wait
+                }
+                catch {
+                    $portTestResult = $false
+                }
+            }
+
+            if (-not $portTestResult) {
+                if ($attempt -lt $RetryCount) {
+                    Start-Sleep -Seconds 2
+                    continue
+                }
+                return $false
+            }
+
+            # Test actual WinRM functionality with timeout
+            $job = Start-Job -ScriptBlock {
+                param($comp)
+                Invoke-Command -ComputerName $comp -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop
+            } -ArgumentList $ComputerName
+
+            $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+            if ($completed) {
+                $result = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                Remove-Job -Job $job -Force
+                if ($result) {
+                    return $true
+                }
+            } else {
+                Remove-Job -Job $job -Force
+            }
+        }
+        catch {
+            # Continue to retry
+        }
+
+        if ($attempt -lt $RetryCount) {
+            Start-Sleep -Seconds 2
+        }
+    }
+    return $false
+}
+
+# Get remote service status with fallback methods and timeout
+function Get-RemoteServiceStatus {
+    param(
+        [string]$ComputerName,
+        [string]$ServiceName,
+        [int]$TimeoutSeconds = 30
+    )
+
+    # Try WinRM first
+    try {
+        if (Test-WinRMConnectivity -ComputerName $ComputerName -TimeoutSeconds 10 -RetryCount 1) {
+            $job = Start-Job -ScriptBlock {
+                param($comp, $svc)
+                Get-Service -Name $svc -ComputerName $comp -ErrorAction Stop
+            } -ArgumentList $ComputerName, $ServiceName
+
+            $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+            if ($completed) {
+                $result = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                Remove-Job -Job $job -Force
+                return $result
+            } else {
+                Remove-Job -Job $job -Force
+                throw "WinRM service check timed out"
+            }
+        }
+    }
+    catch {
+        # WinRM failed, try WMI
+    }
+
+    # Fallback to WMI with timeout
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($comp, $svc)
+            $wmiService = Get-WmiObject -Class Win32_Service -ComputerName $comp -Filter "Name='$svc'" -ErrorAction Stop
+            if ($wmiService) {
+                return [PSCustomObject]@{
+                    Name = $wmiService.Name
+                    Status = switch ($wmiService.State) {
+                        "Running" { "Running" }
+                        "Stopped" { "Stopped" }
+                        "Paused" { "Paused" }
+                        default { $wmiService.State }
+                    }
+                    StartType = $wmiService.StartMode
+                }
+            }
+            return $null
+        } -ArgumentList $ComputerName, $ServiceName
+
+        $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+        if ($completed) {
+            $result = Receive-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force
+            return $result
+        } else {
+            Remove-Job -Job $job -Force
+            throw "WMI service check timed out after $TimeoutSeconds seconds"
+        }
+    }
+    catch {
+        throw "Could not check service '$ServiceName' on '$ComputerName': $($_.Exception.Message)"
+    }
+}
+
+# Execute remote command with timeout and fallback
+function Invoke-RemoteCommand {
+    param(
+        [string]$ComputerName,
+        [scriptblock]$ScriptBlock,
+        [string]$FallbackMessage = "Remote command execution not available",
+        [int]$TimeoutSeconds = 60
+    )
+
+    # Try WinRM first
+    try {
+        if (Test-WinRMConnectivity -ComputerName $ComputerName -TimeoutSeconds 10 -RetryCount 1) {
+            $job = Start-Job -ScriptBlock {
+                param($comp, $script)
+                Invoke-Command -ComputerName $comp -ScriptBlock $script -ErrorAction Stop
+            } -ArgumentList $ComputerName, $ScriptBlock
+
+            $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+            if ($completed) {
+                $result = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                Remove-Job -Job $job -Force
+                return $result
+            } else {
+                Remove-Job -Job $job -Force
+                throw "Remote command timed out after $TimeoutSeconds seconds"
+            }
+        }
+    }
+    catch {
+        if ($_.Exception.Message -like "*timed out*") {
+            throw $_.Exception.Message
+        }
+        # WinRM failed
+    }
+
+    # For some operations, we can't provide a meaningful fallback
+    throw $FallbackMessage
 }
 
 # Add result to collection
@@ -231,11 +467,13 @@ function Test-ADHealth {
             $services = @("ADWS", "KDC", "Netlogon", "DNS")
             foreach ($service in $services) {
                 try {
-                    $svc = Get-Service -Name $service -ComputerName $DC -ErrorAction Stop
-                    if ($svc.Status -ne "Running") {
+                    $svc = Get-RemoteServiceStatus -ComputerName $DC -ServiceName $service
+                    if ($svc -and $svc.Status -ne "Running") {
                         Add-HealthResult -ComputerName $DC -Component "ActiveDirectory" -Check "Service_$service" -Status "Critical" -Message "$service service is $($svc.Status)"
-                    } else {
+                    } elseif ($svc) {
                         Add-HealthResult -ComputerName $DC -Component "ActiveDirectory" -Check "Service_$service" -Status "Pass" -Message "$service service is running"
+                    } else {
+                        Add-HealthResult -ComputerName $DC -Component "ActiveDirectory" -Check "Service_$service" -Status "Warning" -Message "$service service not found"
                     }
                 }
                 catch {
@@ -280,11 +518,13 @@ function Test-DNSHealth {
     foreach ($DNSServer in $DNSServers) {
         try {
             # Check DNS service
-            $dnsService = Get-Service -Name DNS -ComputerName $DNSServer -ErrorAction Stop
-            if ($dnsService.Status -ne "Running") {
+            $dnsService = Get-RemoteServiceStatus -ComputerName $DNSServer -ServiceName "DNS"
+            if ($dnsService -and $dnsService.Status -ne "Running") {
                 Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Service" -Status "Critical" -Message "DNS service is $($dnsService.Status)"
-            } else {
+            } elseif ($dnsService) {
                 Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Service" -Status "Pass" -Message "DNS service is running"
+            } else {
+                Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Service" -Status "Critical" -Message "DNS service not found"
             }
 
             # Test DNS resolution
@@ -297,14 +537,18 @@ function Test-DNSHealth {
                 Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Resolution" -Status "Critical" -Message "DNS resolution failed: $($_.Exception.Message)"
             }
 
-            # Check DNS zones
+            # Check DNS zones (requires WinRM)
             try {
-                $zones = Get-DnsServerZone -ComputerName $DNSServer -ErrorAction Stop
-                $errorZones = $zones | Where-Object { $_.ZoneType -eq "Primary" -and $_.IsDsIntegrated -eq $false }
-                if ($errorZones) {
-                    Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Zones" -Status "Warning" -Message "Non-AD integrated zones detected" -Details $errorZones
+                if (Test-WinRMConnectivity -ComputerName $DNSServer) {
+                    $zones = Get-DnsServerZone -ComputerName $DNSServer -ErrorAction Stop
+                    $errorZones = $zones | Where-Object { $_.ZoneType -eq "Primary" -and $_.IsDsIntegrated -eq $false }
+                    if ($errorZones) {
+                        Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Zones" -Status "Warning" -Message "Non-AD integrated zones detected" -Details $errorZones
+                    } else {
+                        Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Zones" -Status "Pass" -Message "All primary zones are AD integrated"
+                    }
                 } else {
-                    Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Zones" -Status "Pass" -Message "All primary zones are AD integrated"
+                    Add-HealthResult -ComputerName $DNSServer -Component "DNS" -Check "Zones" -Status "Info" -Message "DNS zone check skipped - WinRM not available"
                 }
             }
             catch {
@@ -328,12 +572,22 @@ function Test-SystemHealth {
     Write-Host "Checking System Health..." -ForegroundColor Cyan
 
     foreach ($Computer in $ComputerNames) {
+        Write-Verbose "Testing connectivity to $Computer..."
+
+        # Test basic connectivity with retries - early exit if unreachable
+        if (-not (Test-ComputerConnectivity -ComputerName $Computer -TimeoutSeconds $Config.ConnectivityTimeoutSeconds -RetryCount $Config.ConnectivityRetryCount)) {
+            Add-HealthResult -ComputerName $Computer -Component "System" -Check "Connectivity" -Status "Critical" -Message "Computer is not reachable after $($Config.ConnectivityRetryCount) retries"
+
+            # Add placeholder entries for other system checks to show they were skipped
+            Add-HealthResult -ComputerName $Computer -Component "System" -Check "DiskSpace" -Status "Info" -Message "Skipped - Computer unreachable" -OSVersion "Unknown"
+            Add-HealthResult -ComputerName $Computer -Component "System" -Check "Uptime" -Status "Info" -Message "Skipped - Computer unreachable" -OSVersion "Unknown"
+            Add-HealthResult -ComputerName $Computer -Component "System" -Check "Memory" -Status "Info" -Message "Skipped - Computer unreachable" -OSVersion "Unknown"
+            continue
+        }
+
+        Add-HealthResult -ComputerName $Computer -Component "System" -Check "Connectivity" -Status "Pass" -Message "Computer is reachable"
+
         try {
-            # Test connectivity
-            if (-not (Test-NetConnection -ComputerName $Computer -InformationLevel Quiet)) {
-                Add-HealthResult -ComputerName $Computer -Component "System" -Check "Connectivity" -Status "Critical" -Message "Computer is not reachable"
-                continue
-            }
 
             # Get OS version for this computer
             $osVersion = ""
@@ -413,28 +667,43 @@ function Test-SystemHealth {
 
 # Test Storage Health
 function Test-StorageHealth {
-    param([string[]]$ComputerNames)
+    param(
+        [string[]]$ComputerNames,
+        [hashtable]$Config
+    )
 
     Write-Host "Checking Storage Health..." -ForegroundColor Cyan
 
     foreach ($Computer in $ComputerNames) {
+        # Test basic connectivity first - skip if unreachable
+        if (-not (Test-ComputerConnectivity -ComputerName $Computer -TimeoutSeconds 5 -RetryCount 1)) {
+            Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "Connectivity" -Status "Critical" -Message "Computer unreachable - storage checks skipped"
+            continue
+        }
+
         try {
-            # Check for disk errors in event log
-            $diskErrors = Get-WinEvent -ComputerName $Computer -FilterHashtable @{LogName='System'; ID=7,11,15,153; StartTime=(Get-Date).AddDays(-7)} -ErrorAction SilentlyContinue
+            # Check for disk errors in event log (requires WinRM)
+            if (Test-WinRMConnectivity -ComputerName $Computer -TimeoutSeconds $Config.WinRMTimeoutSeconds -RetryCount 1) {
+                $diskErrors = Get-WinEvent -ComputerName $Computer -FilterHashtable @{LogName='System'; ID=7,11,15,153; StartTime=(Get-Date).AddDays(-21)} -ErrorAction SilentlyContinue
 
-            if ($diskErrors) {
-                $criticalErrors = $diskErrors | Where-Object { $_.Id -in @(7, 11) }
-                $warningErrors = $diskErrors | Where-Object { $_.Id -in @(15, 153) }
+                if ($diskErrors) {
+                    $criticalErrors = $diskErrors | Where-Object { $_.Id -in @(7, 11) }
+                    $warningErrors = $diskErrors | Where-Object { $_.Id -in @(15, 153) }
 
-                if ($criticalErrors) {
-                    Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Critical" -Message "Critical disk errors detected in last 7 days" -Details $criticalErrors
+                    if ($criticalErrors) {
+                        Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Critical" -Message "Critical disk errors detected in last 21 days" -Details $criticalErrors
+                    }
+                    elseif ($warningErrors) {
+                        Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Warning" -Message "Disk warnings detected in last 21 days" -Details $warningErrors
+                    } else {
+                        Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Pass" -Message "No disk errors in last 21 days"
+                    }
                 }
-                elseif ($warningErrors) {
-                    Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Warning" -Message "Disk warnings detected in last 7 days" -Details $warningErrors
+                else {
+                    Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Pass" -Message "No disk errors in last 21 days"
                 }
-            }
-            else {
-                Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Pass" -Message "No disk errors in last 7 days"
+            } else {
+                Add-HealthResult -ComputerName $Computer -Component "Storage" -Check "DiskErrors" -Status "Info" -Message "Event log check skipped - WinRM not available"
             }
 
             # Check disk performance
@@ -471,25 +740,33 @@ function Test-SecurityServices {
     Write-Host "Checking Security Services..." -ForegroundColor Cyan
 
     foreach ($Computer in $ComputerNames) {
+        # Test basic connectivity first - skip if unreachable
+        if (-not (Test-ComputerConnectivity -ComputerName $Computer -TimeoutSeconds 5 -RetryCount 1)) {
+            Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Connectivity" -Status "Critical" -Message "Computer unreachable - security checks skipped"
+            continue
+        }
+
         try {
             # Check Trellix ENS services
             foreach ($service in $Config.TrellixServices) {
                 try {
-                    $svc = Get-Service -Name $service -ComputerName $Computer -ErrorAction Stop
-                    if ($svc.Status -ne "Running") {
+                    $svc = Get-RemoteServiceStatus -ComputerName $Computer -ServiceName $service
+                    if ($svc -and $svc.Status -ne "Running") {
                         Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Critical" -Message "Trellix service $service is $($svc.Status)" -OSVersion "Unknown"
-                    } else {
+                    } elseif ($svc) {
                         Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Pass" -Message "Trellix service $service is running" -OSVersion "Unknown"
+                    } else {
+                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Warning" -Message "Trellix service $service not found" -OSVersion "Unknown"
                     }
                 }
                 catch {
-                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Warning" -Message "Trellix service $service not found or inaccessible" -OSVersion "Unknown"
+                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Trellix_$service" -Status "Warning" -Message "Trellix service $service not found or inaccessible: $($_.Exception.Message)" -OSVersion "Unknown"
                 }
             }
 
             # Check Trellix DAT version and collect version info
             try {
-                $trellixInfo = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                $trellixInfo = Invoke-RemoteCommand -ComputerName $Computer -ScriptBlock {
                     # Get DAT version
                     $datReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\McAfee\AVEngine" -Name "AVDatVersion" -ErrorAction SilentlyContinue
 
@@ -508,7 +785,7 @@ function Test-SecurityServices {
                         EngineVersionMajor = $engineReg.EngineVersionMajor
                         EngineVersionMinor = $engineReg.EngineVersionMinor
                     }
-                } -ErrorAction Stop
+                } -FallbackMessage "Could not retrieve Trellix information - WinRM not available"
 
                 # Get OS version for this computer
                 $osVersion = ""
@@ -576,15 +853,17 @@ function Test-SecurityServices {
             # Check Splunk services
             foreach ($service in $Config.SplunkServices) {
                 try {
-                    $svc = Get-Service -Name $service -ComputerName $Computer -ErrorAction Stop
-                    if ($svc.Status -ne "Running") {
+                    $svc = Get-RemoteServiceStatus -ComputerName $Computer -ServiceName $service
+                    if ($svc -and $svc.Status -ne "Running") {
                         Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Splunk_$service" -Status "Critical" -Message "Splunk service $service is $($svc.Status)"
-                    } else {
+                    } elseif ($svc) {
                         Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Splunk_$service" -Status "Pass" -Message "Splunk service $service is running"
+                    } else {
+                        Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Splunk_$service" -Status "Warning" -Message "Splunk service $service not found"
                     }
                 }
                 catch {
-                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Splunk_$service" -Status "Warning" -Message "Splunk service $service not found or inaccessible"
+                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Splunk_$service" -Status "Warning" -Message "Splunk service $service not found or inaccessible: $($_.Exception.Message)"
                 }
             }
 
@@ -613,11 +892,11 @@ function Test-SecurityServices {
 
             # Check certificates
             try {
-                $expiredCerts = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                $expiredCerts = Invoke-RemoteCommand -ComputerName $Computer -ScriptBlock {
                     Get-ChildItem -Path Cert:\LocalMachine\My | Where-Object {
                         $_.NotAfter -lt (Get-Date).AddDays(90) -and $_.NotAfter -gt (Get-Date)
                     }
-                } -ErrorAction Stop
+                } -FallbackMessage "Could not check certificates - WinRM not available"
 
                 if ($expiredCerts) {
                     $criticalCerts = $expiredCerts | Where-Object { $_.NotAfter -lt (Get-Date).AddDays(30) }
@@ -631,7 +910,11 @@ function Test-SecurityServices {
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Certificates" -Status "Warning" -Message "Could not check certificates: $($_.Exception.Message)"
+                if ($_.Exception.Message -like "*WinRM not available*") {
+                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Certificates" -Status "Info" -Message "Certificate check skipped - WinRM not available"
+                } else {
+                    Add-HealthResult -ComputerName $Computer -Component "Security" -Check "Certificates" -Status "Warning" -Message "Could not check certificates: $($_.Exception.Message)"
+                }
             }
 
         }
@@ -827,8 +1110,8 @@ function Get-WindowsSecuritySummary {
 
     foreach ($Computer in $ComputerNames) {
         try {
-            # Test connectivity first
-            if (-not (Test-NetConnection -ComputerName $Computer -InformationLevel Quiet)) {
+            # Test connectivity first with retries
+            if (-not (Test-ComputerConnectivity -ComputerName $Computer -TimeoutSeconds 5 -RetryCount 1)) {
                 # Add entry for failed connection
                 $Script:WindowsSecuritySummary += [PSCustomObject]@{
                     ComputerName = $Computer
@@ -842,7 +1125,7 @@ function Get-WindowsSecuritySummary {
             }
 
             # Collect comprehensive security information
-            $securityInfo = Invoke-Command -ComputerName $Computer -ScriptBlock {
+            $securityInfo = Invoke-RemoteCommand -ComputerName $Computer -ScriptBlock {
                 $results = @{}
 
                 # Get OS information
@@ -918,17 +1201,28 @@ function Get-WindowsSecuritySummary {
                     $results.BitLockerStatus = "Check Failed"
                 }
 
-                # Check Secure Boot status
+                # Check Secure Boot status (with Server 2019 compatibility)
                 try {
                     $secureBootPolicy = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name "UEFISecureBootEnabled" -ErrorAction SilentlyContinue
                     if ($secureBootPolicy -and $secureBootPolicy.UEFISecureBootEnabled -eq 1) {
                         $results.SecureBootEnabled = "Enabled"
                     } else {
-                        # Alternative check for Secure Boot
-                        $confirmSecureBoot = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
-                        if ($confirmSecureBoot) {
-                            $results.SecureBootEnabled = "Enabled"
-                        } else {
+                        # Alternative check for Secure Boot (may not be available on Server SKUs)
+                        try {
+                            # Check if Confirm-SecureBootUEFI is available
+                            if (Get-Command Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) {
+                                $confirmSecureBoot = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+                                if ($confirmSecureBoot) {
+                                    $results.SecureBootEnabled = "Enabled"
+                                } else {
+                                    $results.SecureBootEnabled = "Disabled"
+                                }
+                            } else {
+                                # Server versions may not have this cmdlet - check registry only
+                                $results.SecureBootEnabled = "Disabled"
+                            }
+                        }
+                        catch {
                             $results.SecureBootEnabled = "Disabled"
                         }
                     }
@@ -937,7 +1231,7 @@ function Get-WindowsSecuritySummary {
                 }
 
                 return $results
-            } -ErrorAction Stop
+            } -FallbackMessage "Could not collect security information - WinRM not available"
 
             # Create security summary entry
             $Script:WindowsSecuritySummary += [PSCustomObject]@{
@@ -951,9 +1245,15 @@ function Get-WindowsSecuritySummary {
 
         } catch {
             # Add entry for failed data collection
+            $reason = if ($_.Exception.Message -like "*WinRM not available*") {
+                "WinRM Not Available"
+            } else {
+                "Data Collection Failed"
+            }
+
             $Script:WindowsSecuritySummary += [PSCustomObject]@{
                 ComputerName = $Computer
-                OSName = "Data Collection Failed"
+                OSName = $reason
                 OSVersion = "N/A"
                 BitLockerStatus = "N/A"
                 SecureBootEnabled = "N/A"
@@ -972,61 +1272,72 @@ function Test-HyperVHealth {
     foreach ($HyperVHost in $HyperVHosts) {
         try {
             # Check Hyper-V service
-            $hypervService = Get-Service -Name vmms -ComputerName $HyperVHost -ErrorAction Stop
-            if ($hypervService.Status -ne "Running") {
+            $hypervService = Get-RemoteServiceStatus -ComputerName $HyperVHost -ServiceName "vmms"
+            if ($hypervService -and $hypervService.Status -ne "Running") {
                 Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "Service" -Status "Critical" -Message "Hyper-V Management service is $($hypervService.Status)"
                 continue
-            } else {
+            } elseif ($hypervService) {
                 Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "Service" -Status "Pass" -Message "Hyper-V Management service is running"
+            } else {
+                Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "Service" -Status "Critical" -Message "Hyper-V Management service not found"
+                continue
             }
 
-            # Check VMs
+            # Check VMs (requires WinRM)
             try {
-                $vms = Get-VM -ComputerName $HyperVHost -ErrorAction Stop
-                foreach ($vm in $vms) {
-                    if ($vm.State -eq "Running") {
-                        # Check integration services
-                        $integrationServices = Get-VMIntegrationService -VM $vm
-                        $outdatedServices = $integrationServices | Where-Object { $_.OperationalStatus -ne "Ok" }
+                if (Test-WinRMConnectivity -ComputerName $HyperVHost) {
+                    $vms = Get-VM -ComputerName $HyperVHost -ErrorAction Stop
+                    foreach ($vm in $vms) {
+                        if ($vm.State -eq "Running") {
+                            # Check integration services
+                            $integrationServices = Get-VMIntegrationService -VM $vm
+                            $outdatedServices = $integrationServices | Where-Object { $_.OperationalStatus -ne "Ok" }
 
-                        if ($outdatedServices) {
-                            Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Integration" -Status "Warning" -Message "Integration services need attention" -Details $outdatedServices
-                        } else {
-                            Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Integration" -Status "Pass" -Message "Integration services OK"
-                        }
+                            if ($outdatedServices) {
+                                Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Integration" -Status "Warning" -Message "Integration services need attention" -Details $outdatedServices
+                            } else {
+                                Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Integration" -Status "Pass" -Message "Integration services OK"
+                            }
 
-                        # Check VM resources
-                        if ($vm.MemoryAssigned -gt ($vm.MemoryMaximum * 0.9)) {
-                            Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Memory" -Status "Warning" -Message "VM memory usage high"
-                        } else {
-                            Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Memory" -Status "Pass" -Message "VM memory usage normal"
+                            # Check VM resources
+                            if ($vm.MemoryAssigned -gt ($vm.MemoryMaximum * 0.9)) {
+                                Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Memory" -Status "Warning" -Message "VM memory usage high"
+                            } else {
+                                Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_Memory" -Status "Pass" -Message "VM memory usage normal"
+                            }
+                        }
+                        elseif ($vm.State -eq "Off") {
+                            Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_State" -Status "Warning" -Message "VM is powered off"
+                        }
+                        else {
+                            Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_State" -Status "Critical" -Message "VM is in $($vm.State) state"
                         }
                     }
-                    elseif ($vm.State -eq "Off") {
-                        Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_State" -Status "Warning" -Message "VM is powered off"
-                    }
-                    else {
-                        Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VM_$($vm.Name)_State" -Status "Critical" -Message "VM is in $($vm.State) state"
-                    }
+                } else {
+                    Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VMs" -Status "Info" -Message "VM check skipped - WinRM not available"
                 }
             }
             catch {
                 Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "VMs" -Status "Warning" -Message "Could not check VMs: $($_.Exception.Message)"
             }
 
-            # Check host resources
+            # Check host resources (requires WinRM)
             try {
-                $hostInfo = Get-VMHost -ComputerName $HyperVHost -ErrorAction Stop
-                $memoryUsage = [math]::Round(($hostInfo.MemoryCapacity - $hostInfo.MemoryAvailable) / $hostInfo.MemoryCapacity * 100, 2)
+                if (Test-WinRMConnectivity -ComputerName $HyperVHost) {
+                    $hostInfo = Get-VMHost -ComputerName $HyperVHost -ErrorAction Stop
+                    $memoryUsage = [math]::Round(($hostInfo.MemoryCapacity - $hostInfo.MemoryAvailable) / $hostInfo.MemoryCapacity * 100, 2)
 
-                if ($memoryUsage -gt 90) {
-                    Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "HostMemory" -Status "Critical" -Message "Host memory usage is $memoryUsage%"
-                }
-                elseif ($memoryUsage -gt 80) {
-                    Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "HostMemory" -Status "Warning" -Message "Host memory usage is $memoryUsage%"
-                }
-                else {
-                    Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "HostMemory" -Status "Pass" -Message "Host memory usage is $memoryUsage%"
+                    if ($memoryUsage -gt 90) {
+                        Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "HostMemory" -Status "Critical" -Message "Host memory usage is $memoryUsage%"
+                    }
+                    elseif ($memoryUsage -gt 80) {
+                        Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "HostMemory" -Status "Warning" -Message "Host memory usage is $memoryUsage%"
+                    }
+                    else {
+                        Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "HostMemory" -Status "Pass" -Message "Host memory usage is $memoryUsage%"
+                    }
+                } else {
+                    Add-HealthResult -ComputerName $HyperVHost -Component "HyperV" -Check "HostResources" -Status "Info" -Message "Host resource check skipped - WinRM not available"
                 }
             }
             catch {
@@ -1042,11 +1353,20 @@ function Test-HyperVHealth {
 
 # Test Licensing Health
 function Test-LicensingHealth {
-    param([string[]]$ComputerNames)
+    param(
+        [string[]]$ComputerNames,
+        [hashtable]$Config
+    )
 
     Write-Host "Checking Licensing Health..." -ForegroundColor Cyan
 
     foreach ($Computer in $ComputerNames) {
+        # Test basic connectivity first - skip if unreachable
+        if (-not (Test-ComputerConnectivity -ComputerName $Computer -TimeoutSeconds 5 -RetryCount 1)) {
+            Add-HealthResult -ComputerName $Computer -Component "Licensing" -Check "Connectivity" -Status "Critical" -Message "Computer unreachable - licensing checks skipped"
+            continue
+        }
+
         try {
             # Check Windows activation status
             try {
@@ -1177,9 +1497,21 @@ function Test-LicensingHealth {
 
             # Check Terminal Services/RDS CAL usage
             try {
-                $rdsStatus = Invoke-Command -ComputerName $Computer -ScriptBlock {
-                    $rdsRole = Get-WindowsFeature -Name "RDS-RD-Server" -ErrorAction SilentlyContinue
-                    if ($rdsRole -and $rdsRole.InstallState -eq "Installed") {
+                $rdsStatus = Invoke-RemoteCommand -ComputerName $Computer -ScriptBlock {
+                    $rdsInstalled = $false
+
+                    # Try Get-WindowsFeature first
+                    try {
+                        $rdsRole = Get-WindowsFeature -Name "RDS-RD-Server" -ErrorAction SilentlyContinue
+                        $rdsInstalled = $rdsRole -and $rdsRole.InstallState -eq "Installed"
+                    }
+                    catch {
+                        # Fallback to service check for systems without ServerManager module
+                        $rdsService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+                        $rdsInstalled = $rdsService -ne $null
+                    }
+
+                    if ($rdsInstalled) {
                         try {
                             $calInfo = Get-WmiObject -Class Win32_TSLicenseReport -ErrorAction SilentlyContinue
                             return @{
@@ -1195,7 +1527,7 @@ function Test-LicensingHealth {
                         }
                     }
                     return @{ RDSInstalled = $false }
-                } -ErrorAction Stop
+                } -FallbackMessage "Could not check RDS licensing - WinRM not available"
 
                 if ($rdsStatus.RDSInstalled) {
                     if ($rdsStatus.CALInfo) {
@@ -1220,17 +1552,26 @@ function Test-LicensingHealth {
 
 # Test Critical Services
 function Test-CriticalServices {
-    param([string[]]$ComputerNames)
+    param(
+        [string[]]$ComputerNames,
+        [hashtable]$Config
+    )
 
     Write-Host "Checking Critical Services..." -ForegroundColor Cyan
 
     foreach ($Computer in $ComputerNames) {
+        # Test basic connectivity first - skip if unreachable
+        if (-not (Test-ComputerConnectivity -ComputerName $Computer -TimeoutSeconds 5 -RetryCount 1)) {
+            Add-HealthResult -ComputerName $Computer -Component "Services" -Check "Connectivity" -Status "Critical" -Message "Computer unreachable - service checks skipped"
+            continue
+        }
+
         try {
             # Check time synchronization
             try {
-                $timeSource = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                $timeSource = Invoke-RemoteCommand -ComputerName $Computer -ScriptBlock {
                     w32tm /query /source
-                } -ErrorAction Stop
+                } -FallbackMessage "Could not check time synchronization - WinRM not available"
 
                 if ($timeSource -like "*Local*") {
                     Add-HealthResult -ComputerName $Computer -Component "Services" -Check "TimeSync" -Status "Warning" -Message "Time source is local CMOS clock"
@@ -1239,29 +1580,35 @@ function Test-CriticalServices {
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "Services" -Check "TimeSync" -Status "Warning" -Message "Could not check time synchronization: $($_.Exception.Message)"
+                if ($_.Exception.Message -like "*WinRM not available*") {
+                    Add-HealthResult -ComputerName $Computer -Component "Services" -Check "TimeSync" -Status "Info" -Message "Time sync check skipped - WinRM not available"
+                } else {
+                    Add-HealthResult -ComputerName $Computer -Component "Services" -Check "TimeSync" -Status "Warning" -Message "Could not check time synchronization: $($_.Exception.Message)"
+                }
             }
 
             # Check print spooler (if server)
             try {
-                $spooler = Get-Service -Name Spooler -ComputerName $Computer -ErrorAction Stop
-                if ($spooler.Status -ne "Running") {
+                $spooler = Get-RemoteServiceStatus -ComputerName $Computer -ServiceName "Spooler"
+                if ($spooler -and $spooler.Status -ne "Running") {
                     Add-HealthResult -ComputerName $Computer -Component "Services" -Check "PrintSpooler" -Status "Warning" -Message "Print spooler is $($spooler.Status)"
-                } else {
+                } elseif ($spooler) {
                     Add-HealthResult -ComputerName $Computer -Component "Services" -Check "PrintSpooler" -Status "Pass" -Message "Print spooler is running"
+                } else {
+                    Add-HealthResult -ComputerName $Computer -Component "Services" -Check "PrintSpooler" -Status "Info" -Message "Print spooler service not found"
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "Services" -Check "PrintSpooler" -Status "Info" -Message "Print spooler service not available"
+                Add-HealthResult -ComputerName $Computer -Component "Services" -Check "PrintSpooler" -Status "Info" -Message "Print spooler service not available: $($_.Exception.Message)"
             }
 
             # Check system file integrity
             try {
-                $sfcResults = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                $sfcResults = Invoke-RemoteCommand -ComputerName $Computer -ScriptBlock {
                     $sfcLog = Get-Content "$env:windir\Logs\CBS\CBS.log" -Tail 50 -ErrorAction SilentlyContinue
                     $corruptFiles = $sfcLog | Where-Object { $_ -like "*corrupt*" -or $_ -like "*repair*" }
                     return $corruptFiles.Count
-                } -ErrorAction Stop
+                } -FallbackMessage "Could not check system file integrity - WinRM not available"
 
                 if ($sfcResults -gt 0) {
                     Add-HealthResult -ComputerName $Computer -Component "Services" -Check "SystemIntegrity" -Status "Warning" -Message "System file corruption detected in CBS log"
@@ -1270,7 +1617,11 @@ function Test-CriticalServices {
                 }
             }
             catch {
-                Add-HealthResult -ComputerName $Computer -Component "Services" -Check "SystemIntegrity" -Status "Info" -Message "Could not check system file integrity"
+                if ($_.Exception.Message -like "*WinRM not available*") {
+                    Add-HealthResult -ComputerName $Computer -Component "Services" -Check "SystemIntegrity" -Status "Info" -Message "System integrity check skipped - WinRM not available"
+                } else {
+                    Add-HealthResult -ComputerName $Computer -Component "Services" -Check "SystemIntegrity" -Status "Info" -Message "Could not check system file integrity: $($_.Exception.Message)"
+                }
             }
 
         }
@@ -1573,20 +1924,54 @@ function Main {
     }
 
     Write-Host "Target computers: $($targetComputers -join ', ')" -ForegroundColor Cyan
+    Write-Host "Connectivity timeout: $($config.ConnectivityTimeoutSeconds)s, Retries: $($config.ConnectivityRetryCount), WinRM timeout: $($config.WinRMTimeoutSeconds)s" -ForegroundColor Yellow
 
     # Get domain controllers
     $domainControllers = (Get-ADDomainController -Filter *).Name
 
-    # Get Hyper-V hosts
+    # Get Hyper-V hosts with compatibility for different Windows versions
     $hypervHosts = @()
     if (-not $SkipHyperV) {
-        $hypervHosts = $targetComputers | Where-Object {
+        foreach ($computer in $targetComputers) {
             try {
-                $feature = Get-WindowsFeature -Name Hyper-V -ComputerName $_ -ErrorAction Stop
-                return $feature.InstallState -eq "Installed"
+                $isHypervHost = $false
+
+                # Try Get-WindowsFeature first (Server versions with ServerManager module)
+                try {
+                    if (Test-WinRMConnectivity -ComputerName $computer) {
+                        $feature = Get-WindowsFeature -Name Hyper-V -ComputerName $computer -ErrorAction Stop
+                        $isHypervHost = $feature.InstallState -eq "Installed"
+                    }
+                }
+                catch {
+                    # Fallback to WMI check for systems without ServerManager module
+                    try {
+                        $hypervService = Get-WmiObject -Class Win32_Service -ComputerName $computer -Filter "Name='vmms'" -ErrorAction Stop
+                        $isHypervHost = $hypervService -ne $null
+                    }
+                    catch {
+                        # Final fallback - try to query Hyper-V directly
+                        try {
+                            if (Test-WinRMConnectivity -ComputerName $computer) {
+                                $testResult = Invoke-Command -ComputerName $computer -ScriptBlock {
+                                    Get-Service -Name vmms -ErrorAction SilentlyContinue
+                                } -ErrorAction Stop
+                                $isHypervHost = $testResult -ne $null
+                            }
+                        }
+                        catch {
+                            $isHypervHost = $false
+                        }
+                    }
+                }
+
+                if ($isHypervHost) {
+                    $hypervHosts += $computer
+                }
             }
             catch {
-                return $false
+                # Skip this computer if all checks fail
+                continue
             }
         }
     }
@@ -1623,16 +2008,16 @@ function Main {
 
     # Run health checks for all systems
     Test-SystemHealth -ComputerNames $targetComputers -Config $config
-    Test-StorageHealth -ComputerNames $targetComputers
+    Test-StorageHealth -ComputerNames $targetComputers -Config $config
     Test-SecurityServices -ComputerNames $targetComputers -Config $config
-    Test-LicensingHealth -ComputerNames $targetComputers
+    Test-LicensingHealth -ComputerNames $targetComputers -Config $config
 
     # Collect Windows Security Summary for all systems
     Get-WindowsSecuritySummary -ComputerNames $targetComputers
 
     # Run server-specific checks
     if ($serverComputers.Count -gt 0) {
-        Test-CriticalServices -ComputerNames $serverComputers
+        Test-CriticalServices -ComputerNames $serverComputers -Config $config
     }
 
     # Run client-specific checks
